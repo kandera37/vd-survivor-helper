@@ -1,5 +1,5 @@
 --!strict
--- VD Killer Ability Radar v1.0
+-- VD Killer Ability Radar v1.1
 -- Read-only telemetry. It never fires remotes and never writes movement, camera,
 -- physics, or character properties. The published state is intended for Helper
 -- and Assist to consume without another Workspace scan.
@@ -31,6 +31,8 @@ local bindings = setmetatable({}, { __mode = "k" })
 local entries = setmetatable({}, { __mode = "k" })
 local lastPublish = -math.huge
 local revision = 0
+local UPDATE_INTERVAL = 0.10
+local SIGNAL_DISTANCE = 250
 
 local EXACT_ANIMATIONS = {
 	["139366495070441"] = "Stalker",
@@ -58,7 +60,8 @@ local ATTRIBUTE_NAMES = {
 }
 
 local runtime = {
-	Version = "1.0-AUDITCORE",
+	Version = "1.1-IDENTITY-QUIET",
+	Debug = false,
 	Running = true,
 	Revision = 0,
 	Primary = nil,
@@ -106,27 +109,23 @@ local function normaliseId(value)
 end
 
 local function classFromText(text)
-	local lowered = string.lower(tostring(text or ""))
-	for token, className in pairs(CLASS_NAMES) do
-		if string.find(lowered, token, 1, true) then
-			return className
-		end
-	end
-	return nil
+	local token = string.lower(tostring(text or "")):gsub("[^%w]", "")
+	return CLASS_NAMES[token]
 end
 
 local function modelClass(model)
 	if not model then
 		return "Unknown"
 	end
-	for _, attribute in ipairs({ "KillerClass", "KillerType", "SelectedKiller", "KillerName", "killer" }) do
-		local value = model:GetAttribute(attribute)
-		local fromAttribute = classFromText(value)
-		if fromAttribute then
-			return fromAttribute
+	local player = Players:GetPlayerFromCharacter(model)
+	for _, source in ipairs(player and { model, player } or { model }) do
+		for _, attribute in ipairs({ "KillerClass", "KillerType", "SelectedKiller", "KillerName", "killer" }) do
+			local fromAttribute = classFromText(source:GetAttribute(attribute))
+			if fromAttribute then return fromAttribute end
 		end
 	end
-	local fromName = classFromText(model.Name)
+	-- Player names are not role or class evidence.
+	local fromName = not player and classFromText(model.Name)
 	return fromName or "Unknown"
 end
 
@@ -140,6 +139,26 @@ local function isFriendly(model)
 	end
 	if localPlayer.Team and player.Team and localPlayer.Team == player.Team then
 		return true
+	end
+	return false
+end
+
+local function isConfirmedKiller(model)
+	if not model or not model:IsA("Model")
+		or not model:IsDescendantOf(Workspace) or isFriendly(model) then return false end
+	local player = Players:GetPlayerFromCharacter(model)
+	local team = player and player.Team
+	local teamName = team and string.lower(team.Name) or ""
+	if teamName == "killer" or teamName == "killers" then return true end
+	-- SelectedKiller is a stored loadout even on survivors/spectators. Require
+	-- live role evidence before reading it for class display.
+	if teamName == "survivor" or teamName == "survivors" or teamName == "spectator"
+		or teamName == "spectators" then return false end
+	if CollectionService:HasTag(model, "Killer") then return true end
+	for _, source in ipairs(player and { model, player } or { model }) do
+		if source:GetAttribute("IsKiller") == true or source:GetAttribute("Killer") == true then return true end
+		local role = string.lower(tostring(source:GetAttribute("Role") or ""))
+		if role == "killer" then return true end
 	end
 	return false
 end
@@ -169,29 +188,28 @@ local function distanceTo(model)
 end
 
 local function inferModel(...)
-	local candidates = { ... }
-	for i = 1, math.min(#candidates, 8) do
+	local candidates = table.pack(...)
+	local explicitModel = false
+	for i = 1, math.min(candidates.n, 8) do
 		local value = candidates[i]
 		if typeof(value) == "Instance" then
-			if value:IsA("Model") then
-				if entries[value] or (not isFriendly(value) and (modelClass(value) ~= "Unknown" or value:FindFirstChildOfClass("Humanoid"))) then
-					return value
-				end
-			end
-			local parent = value:FindFirstAncestorOfClass("Model")
-			if parent and (entries[parent] or (not isFriendly(parent) and parent:FindFirstChildOfClass("Humanoid"))) then
-				return parent
+			local model = value:IsA("Player") and value.Character
+				or (value:IsA("Model") and value or value:FindFirstAncestorOfClass("Model"))
+			if model then
+				explicitModel = true
+				if isConfirmedKiller(model) then return model end
 			end
 		end
 	end
-	local best, bestDistance = nil, math.huge
+	if explicitModel then return nil end
+	local only = nil
 	for model in pairs(entries) do
-		local distance = distanceTo(model)
-		if distance < bestDistance then
-			best, bestDistance = model, distance
+		if isConfirmedKiller(model) and distanceTo(model) <= SIGNAL_DISTANCE then
+			if only then return nil end -- anonymous events cannot choose between owners
+			only = model
 		end
 	end
-	return best
+	return only
 end
 
 local function attributeSnapshot(model)
@@ -213,7 +231,9 @@ local function classifyAnimation(track)
 	local id = animation and normaliseId(animation.AnimationId)
 	local exactClass = id and EXACT_ANIMATIONS[id]
 	local name = string.lower(tostring(track.Name or ""))
-	local kind = "Animation"
+	local kind = exactClass and "WeaponAttack" or nil
+	if track.Looped or (not exactClass and track.Priority
+		and track.Priority.Value < Enum.AnimationPriority.Action.Value) then return nil, id, exactClass end
 	if string.find(name, "lunge", 1, true) or string.find(name, "dash", 1, true) then
 		kind = "Lunge"
 	elseif string.find(name, "attack", 1, true) or string.find(name, "hit", 1, true) or string.find(name, "slash", 1, true) then
@@ -240,6 +260,10 @@ local function logTransition(entry, reason)
 	end
 	entry.lastSignature = nextSignature
 	entry.lastReason = reason
+	if not runtime.Debug or entry.distance > SIGNAL_DISTANCE then return end
+	local stamp = now()
+	if stamp - (entry.lastLogAt or -math.huge) < 2.0 then return end
+	entry.lastLogAt = stamp
 	print(string.format(
 		"[VD Killer Ability Radar] %s %s phase=%s ability=%s dist=%.1f source=%s",
 		tostring(entry.class), tostring(entry.model.Name), tostring(entry.phase),
@@ -258,7 +282,7 @@ local function publish(force)
 	local rows = {}
 	local primary, bestDistance = nil, math.huge
 	for model, entry in pairs(entries) do
-		if model.Parent then
+		if isConfirmedKiller(model) then
 			entry.distance = distanceTo(model)
 			entry.attrs = attributeSnapshot(model)
 			local row = {
@@ -294,11 +318,14 @@ local function updateEntry(entry, ability, source, modelHint, reason)
 			entry = hinted
 		end
 	end
+	if not ability or not isConfirmedKiller(entry.model)
+		or distanceTo(entry.model) > SIGNAL_DISTANCE then return end
 	entry.ability = ability or entry.ability or "Unknown"
 	entry.source = source or entry.source or "unknown"
 	entry.lastSignalAt = now()
 	entry.activeUntil = entry.lastSignalAt + 1.75
-	entry.phase = "ability"
+	-- refreshPhase owns precedence; an animation must not temporarily overwrite
+	-- stunned/immobile/chase on every event and produce two opposing log lines.
 	table.insert(runtime.RecentEvents, 1, {
 		At = entry.lastSignalAt,
 		Model = entry.model,
@@ -309,8 +336,7 @@ local function updateEntry(entry, ability, source, modelHint, reason)
 	while #runtime.RecentEvents > 32 do
 		table.remove(runtime.RecentEvents)
 	end
-	logTransition(entry, reason or "remote")
-	publish(true)
+	publish(false)
 end
 
 local function onAnimation(entry, track)
@@ -321,6 +347,7 @@ local function onAnimation(entry, track)
 	if exactClass then
 		entry.class = exactClass
 	end
+	if not kind then return end
 	entry.animationId = id
 	updateEntry(entry, kind, "AnimationPlayed", nil, "animation")
 end
@@ -329,6 +356,8 @@ local function bindAnimator(entry, animator, token)
 	if not animator or not animator:IsA("Animator") then
 		return
 	end
+	if entry.animators[animator] then return end
+	entry.animators[animator] = true
 	remember(entry.connections, animator.AnimationPlayed:Connect(function(track)
 		if running and entry.generation == token and entry.model.Parent then
 			onAnimation(entry, track)
@@ -342,6 +371,8 @@ local function refreshPhase(entry)
 	end
 	entry.distance = distanceTo(entry.model)
 	entry.attrs = attributeSnapshot(entry.model)
+	local resolvedClass = modelClass(entry.model)
+	entry.class = resolvedClass ~= "Unknown" and resolvedClass or entry.class
 	local current = now()
 	if entry.attrs.IsStunned == true then
 		entry.phase = "stunned"
@@ -362,7 +393,7 @@ local function refreshPhase(entry)
 end
 
 local function bindModel(model)
-	if not running or not model or not model:IsA("Model") or isFriendly(model) then
+	if not running or not isConfirmedKiller(model) then
 		return
 	end
 	if entries[model] then
@@ -383,6 +414,7 @@ local function bindModel(model)
 		attrs = attributeSnapshot(model),
 		generation = token,
 		connections = {},
+		animators = setmetatable({}, { __mode = "k" }),
 		lastSignature = nil,
 		lastReason = nil,
 	}
@@ -438,26 +470,23 @@ local function scanKillerModels()
 	-- tag or applies it after the character has already spawned.
 	for _, player in ipairs(Players:GetPlayers()) do
 		local character = player.Character
-		if character and character:IsA("Model") and player ~= localPlayer and not isFriendly(character) then
+		if character and isConfirmedKiller(character) then
 			seen[character] = true
 			bindModel(character)
 		end
 	end
 	-- Fallback for rounds where the server has not replicated the Killer tag yet.
 	for _, child in ipairs(Workspace:GetChildren()) do
-		if child:IsA("Model") and not isFriendly(child) then
-			local class = modelClass(child)
-			if class ~= "Unknown" or child:GetAttribute("Killer") ~= nil then
-				seen[child] = true
-				bindModel(child)
-			end
+		if isConfirmedKiller(child) then
+			seen[child] = true
+			bindModel(child)
 		end
 	end
 	for model, entry in pairs(entries) do
 		if not model.Parent then
 			entries[model] = nil
 			disconnectAll(entry.connections)
-		elseif not seen[model] and model:IsDescendantOf(Workspace) == false then
+		elseif not seen[model] or not isConfirmedKiller(model) then
 			entries[model] = nil
 			disconnectAll(entry.connections)
 		end
@@ -524,7 +553,6 @@ local function connectRemotes()
 		{ { "Remotes", "Killers", "Cure", "CancelFlask" }, "CureCancelFlask", "Cure" },
 		{ { "Remotes", "Killers", "SlowAttack" }, "SlowAttack", nil },
 		{ { "Remotes", "Killers", "Damageviz" }, "Damage", nil },
-		{ { "Remotes", "Chase", "ChaseMusicEvent" }, "ChaseMusic", nil },
 	}
 	for _, spec in ipairs(specs) do
 		connectRemote(spec[1], spec[2], spec[3])
@@ -542,11 +570,13 @@ end))
 connectRemotes()
 
 local scanAccumulator = 0
+local updateAccumulator = 0
 remember(connections, RunService.Heartbeat:Connect(function(delta)
 	if not running then
 		return
 	end
 	scanAccumulator += delta
+	updateAccumulator += delta
 	if scanAccumulator >= 1.0 then
 		scanAccumulator = 0
 		scanKillerModels()
@@ -554,6 +584,8 @@ remember(connections, RunService.Heartbeat:Connect(function(delta)
 		-- idempotent path lookup; remoteBindings prevents duplicate callbacks.
 		connectRemotes()
 	end
+	if updateAccumulator < UPDATE_INTERVAL then return end
+	updateAccumulator = 0
 	for _, entry in pairs(entries) do
 		if entry.model.Parent then
 			refreshPhase(entry)
@@ -586,4 +618,4 @@ end
 runtime.Stop = stop
 
 scanKillerModels()
-print("[VD Killer Ability Radar] ready; read-only event/attribute monitor active")
+print("[VD Killer Ability Radar v1.1][READY] confirmed killers only | update=10Hz | transition logs OFF")

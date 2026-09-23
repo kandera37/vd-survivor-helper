@@ -1,6 +1,6 @@
 --!strict
 --==============================================================
--- VD INTERACTION STATE MONITOR v1.0
+-- VD INTERACTION STATE MONITOR v1.1
 --
 -- Read-only local interaction telemetry for VD Survivor Helper modules.
 -- It observes native attributes, CollectionService tags, GUI visibility,
@@ -73,6 +73,7 @@ local POINT_TAGS = {
 
 local runtime = {
 	running = true,
+	Debug = false,
 	connections = {} :: {RBXScriptConnection},
 	characterConnections = {} :: {RBXScriptConnection},
 	sourceConnections = {} :: {RBXScriptConnection},
@@ -471,7 +472,7 @@ local function publishState(force)
 	runtime.snapshot = snapshot
 	runtime.dirty = false
 	_G.VDInteractionState = snapshot
-	if changed then
+	if changed and runtime.Debug then
 		print(string.format(
 			"[VD INTERACTION][STATE] repair=%s heal=%s vault=%s pallet=%s exit=%s hook=%s carried=%s stunned=%s skill=%s action=%s",
 			tostring(snapshot.isRepairing),

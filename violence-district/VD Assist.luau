@@ -86,6 +86,9 @@ local CONFIG = {
 	exitFallbackOpenSeconds = 20.0,
 	repairPointRescanMinimum = 18.0,
 	repairPointRescanJitter = 9.0,
+	-- Route discovery is incremental. Keep one batch under a small wall-clock
+	-- budget so a streamed map cannot monopolize a render/heartbeat step.
+	scanBatchBudget = 0.002,
 
 	-- VD normally spawns two more physical generators than survivors must finish.
 	-- Use objective count, not every remaining model, for late-game and exit logic.
@@ -116,6 +119,11 @@ local runtime = {
 	generators = {},
 	exits = {},
 	routes = {},
+	-- Successful route anchors are stable for a model's lifetime. Weak keys
+	-- avoid retaining streamed-out map models and prevent repeated descendant
+	-- walks when DescendantAdded/tag callbacks mention the same object.
+	routeAnchorCache = setmetatable({}, {__mode = "k"}),
+	routeAddAt = setmetatable({}, {__mode = "k"}),
 	-- Per-round progress samples are cleared whenever the map changes.  Keep
 	-- this table owned by the runtime so a first scan cannot call table.clear
 	-- on a missing field (older hot-reloaded copies did not initialize it).
@@ -1564,6 +1572,11 @@ end
 
 local function namedBasePart(root, wantedName)
 	if not root then return nil end
+	local direct = root:FindFirstChild(wantedName)
+	if direct and direct:IsA("BasePart") then return direct end
+	-- Named anchors in the supplied map are direct children. Keep a bounded
+	-- fallback for streamed variants, but call it only after strict model
+	-- evidence has identified a real route model (never during classification).
 	for _, object in ipairs(root:GetDescendants()) do
 		if object:IsA("BasePart") and normalize(object.Name) == normalize(wantedName) then
 			return object
@@ -1574,11 +1587,19 @@ end
 
 local function palletAnchor(model)
 	if not model or not model:IsA("Model") then return nil end
+	local cached = runtime.routeAnchorCache[model]
+	if cached and cached.kind == "Pallet" and cached.part and cached.part.Parent then
+		return cached.part
+	end
 	for _, name in ipairs({"Primary1", "Primary2", "PrimaryPartPallet"}) do
 		local part = namedBasePart(model, name)
-		if part then return part end
+		if part then
+			runtime.routeAnchorCache[model] = {kind = "Pallet", part = part}
+			return part
+		end
 	end
 	if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+		runtime.routeAnchorCache[model] = {kind = "Pallet", part = model.PrimaryPart}
 		return model.PrimaryPart
 	end
 	local best, bestVolume = nil, -1
@@ -1593,13 +1614,18 @@ local function palletAnchor(model)
 			end
 		end
 	end
+	if best then runtime.routeAnchorCache[model] = {kind = "Pallet", part = best} end
 	return best
 end
 
 local function windowAnchor(model)
 	if not model then return nil end
+	local cached = runtime.routeAnchorCache[model]
+	if cached and cached.kind == "Window" and cached.part and cached.part.Parent then
+		return cached.part
+	end
 	for _, wanted in ipairs({"VaultTrigger", "VaultPoint", "WindowTrigger", "WindowPoint", "Trigger", "Interaction"}) do
-		local trigger = model:FindFirstChild(wanted, true)
+		local trigger = model:FindFirstChild(wanted)
 		if trigger and trigger:IsA("BasePart") then return trigger end
 	end
 	-- A number of maps expose only a visible frame/board and keep the vault
@@ -1613,11 +1639,14 @@ local function windowAnchor(model)
 			if not name:find("trigger", 1, true)
 				and not name:find("hitbox", 1, true)
 				and not name:find("prompt", 1, true) then
+				runtime.routeAnchorCache[model] = {kind = "Window", part = object}
 				return object
 			end
 		end
 	end
-	return objectPart(model)
+	local fallback = objectPart(model)
+	if fallback then runtime.routeAnchorCache[model] = {kind = "Window", part = fallback} end
+	return fallback
 end
 
 local function fullPath(instance)
@@ -1674,6 +1703,10 @@ end
 
 local function addRoute(root, kind, partOverride)
 	if not root then return end
+	local now = os.clock()
+	local lastAdd = runtime.routeAddAt[root]
+	if lastAdd and now - lastAdd < 0.12 and runtime.routes[root] then return end
+	runtime.routeAddAt[root] = now
 	local path = fullPath(root)
 	local manualKind = routeConfig.whitelist[path]
 	if manualKind ~= nil then kind = tostring(manualKind) end
@@ -1711,20 +1744,23 @@ local function addRoute(root, kind, partOverride)
 	}
 end
 
-local function exactAncestorModel(instance, expectedName)
-	local current = instance
-	for _ = 1, 7 do
-		if not current or current == Workspace then break end
-		local normalized = current:IsA("Model") and normalize(current.Name) or ""
-		if current:IsA("Model")
-			and (normalized == expectedName
-				or normalized:find(expectedName, 1, true)
-				or (expectedName == "window" and normalized:find("vault", 1, true))) then
-			return current
+local function directWindowEvidence(model)
+	if not model or not model:IsA("Model") then return false end
+	local modelName = normalize(model.Name)
+	local ownTag = CollectionService:HasTag(model, "window")
+		or CollectionService:HasTag(model, "Window")
+	if modelName ~= "window" and not ownTag then return false end
+	for _, child in ipairs(model:GetChildren()) do
+		local childName = normalize(child.Name)
+		if CollectionService:HasTag(child, "VaultPoint")
+			or CollectionService:HasTag(child, "window")
+			or childName == "vaulttrigger"
+			or childName == "vaultpoint"
+			or childName == "bottom" then
+			return true
 		end
-		current = current.Parent
 	end
-	return nil
+	return false
 end
 
 local function addWindowCandidate(instance)
@@ -1732,22 +1768,29 @@ local function addWindowCandidate(instance)
 	local name = normalize(instance.Name)
 	local tagged = CollectionService:HasTag(instance, "VaultPoint")
 		or CollectionService:HasTag(instance, "window")
-	local root = exactAncestorModel(instance, "window")
-	-- A few streamed map copies keep the Window model under a generated
-	-- container name. The tagged VaultPoint/window part is still authoritative;
-	-- walk to its nearest model instead of dropping the route in that case.
+	local root = nil
+	if instance:IsA("Model") and directWindowEvidence(instance) then
+		root = instance
+	elseif instance.Parent and instance.Parent:IsA("Model")
+		and directWindowEvidence(instance.Parent) then
+		root = instance.Parent
+	end
+	-- A tagged marker belongs only to its immediate owning Window model. Never
+	-- promote a generic tagged descendant to Maze/Map or another container.
 	if not root and tagged then
-		local current = instance.Parent
-		for _ = 1, 12 do
-			if not current or current == Workspace then break end
-			if current:IsA("Model") then
-				root = current
-				break
+		-- A tagged VaultPoint/window part belongs to its immediate model in the
+		-- supplied map. Never promote it to Map/Maze merely because an ancestor
+		-- happens to contain a window somewhere below it.
+		local owner = instance.Parent
+		if owner and owner:IsA("Model") then
+			local ownerName = normalize(owner.Name)
+			if (ownerName == "window" or ownerName:find("vault", 1, true))
+				and directWindowEvidence(owner) then
+				root = owner
 			end
-			current = current.Parent
 		end
 	end
-	if not root then return end
+	if not root or not directWindowEvidence(root) then return end
 	-- Maps differ on whether the vault marker is named VaultTrigger, Trigger,
 	-- WindowPoint, or only carries the VaultPoint tag.  Once an instance sits in
 	-- a clearly named window/vault model, accept the model's concrete anchor as
@@ -1772,28 +1815,31 @@ end
 local function isRealPalletModel(model)
 	if not model or not model:IsA("Model") then return false end
 	local name = normalize(model.Name)
-	local taggedPoint = false
-	for _, object in ipairs(model:GetDescendants()) do
-		if CollectionService:HasTag(object, "PalletPoint") then
-			taggedPoint = true
-			break
+	local modelTagged = CollectionService:HasTag(model, "Pallet")
+		or CollectionService:HasTag(model, "pallet")
+	local namedModel = name == "palletwrong" or name == "pallet"
+	if not modelTagged and not namedModel then return false end
+	-- Evidence must be owned by this model. In particular, do not use a tagged
+	-- descendant anywhere in Map/Maze to promote the container to a pallet.
+	local directPoint = false
+	local directAnchor = false
+	for _, child in ipairs(model:GetChildren()) do
+		if CollectionService:HasTag(child, "PalletPoint")
+			or normalize(child.Name) == "palletpoint" then
+			directPoint = true
+		end
+		if child:IsA("BasePart") then
+			local childName = normalize(child.Name)
+			if childName == "primary1" or childName == "primary2"
+				or childName == "primarypartpallet" or childName == "palletpoint" then
+				directAnchor = true
+			end
 		end
 	end
-	if name ~= "palletwrong"
-		and not name:find("pallet", 1, true)
-		and not CollectionService:HasTag(model, "Pallet")
-		and not CollectionService:HasTag(model, "pallet")
-		and not taggedPoint then
+	if not directPoint and not directAnchor and not model.PrimaryPart then
 		return false
 	end
-	local physicalCount = 0
-	for _, object in ipairs(model:GetDescendants()) do
-		if object:IsA("BasePart") then
-			physicalCount += 1
-			if physicalCount >= 1 then break end
-		end
-	end
-	return physicalCount >= 1 and palletAnchor(model) ~= nil
+	return palletAnchor(model) ~= nil
 end
 
 local function addPalletCandidate(instance)
@@ -1861,6 +1907,7 @@ local function scanWorkspace()
 		local queue = {searchRoot}
 		local head = 1
 		local processed = 0
+		local batchStartedAt = os.clock()
 		while runtime.running and _G[KEY] == runtime and head <= #queue do
 			local parent = queue[head]
 			head += 1
@@ -1883,8 +1930,13 @@ local function scanWorkspace()
 						addWindowCandidate(object)
 					end
 					processed += 1
-					if processed % 90 == 0 then
+					-- Keep each scan slice below the configured wall-clock budget.
+					-- DescendantAdded remains responsible for newly streamed objects;
+					-- this yield only protects the initial/periodic index pass.
+					if processed % 90 == 0
+						or os.clock() - batchStartedAt >= CONFIG.scanBatchBudget then
 						RunService.Heartbeat:Wait()
+						batchStartedAt = os.clock()
 					end
 				end
 			end
@@ -2508,14 +2560,19 @@ for _, tag in ipairs({
 }) do
 	remember(CollectionService:GetInstanceAddedSignal(tag):Connect(function(instance)
 		if not runtime.running then return end
-		state.scanDirty = true
+		-- Occupancy tags are state changes on an already indexed generator
+		-- point, not structural map additions. Dirtying the whole workspace here
+		-- caused one full scan per repair interaction.
+		if tag ~= "GeneratorPointInUse" then state.scanDirty = true end
 		addGeneratorCandidate(instance)
-		addExitCandidate(instance)
-		addPalletCandidate(instance)
-		addWindowCandidate(instance)
+		if tag ~= "GeneratorPointInUse" then
+			addExitCandidate(instance)
+			addPalletCandidate(instance)
+			addWindowCandidate(instance)
+		end
 	end))
 	remember(CollectionService:GetInstanceRemovedSignal(tag):Connect(function()
-		if runtime.running then state.scanDirty = true end
+		if runtime.running and tag ~= "GeneratorPointInUse" then state.scanDirty = true end
 	end))
 end
 

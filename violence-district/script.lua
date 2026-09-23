@@ -1,5 +1,5 @@
 --!strict
--- VD Unified Loader v1.0
+-- VD Unified Loader v1.1
 --
 -- One entry point for the current standalone VD modules.  The loader only
 -- downloads and executes the files below; it does not write movement, camera,
@@ -8,6 +8,8 @@
 
 local BASE_URL = "https://raw.githubusercontent.com/kandera37/vd-survivor-helper/refs/heads/main/violence-district/"
 local RUNTIME_KEY = "__VD_UNIFIED_LOADER_V1"
+local LOADER_VERSION = "1.1"
+local BUILD_TAG = "2026-09-23-visual-telemetry-fix"
 
 local MODULES = {
 	-- Providers first: Assist publishes the generator/objective cache used by
@@ -35,6 +37,11 @@ local function callStop(value: any, reason: string)
 	end
 	local ok = pcall(value.Stop, reason)
 	return ok
+end
+
+local function isCurrent(runtime: any): boolean
+	return runtime.Running == true
+		and rawget(_G, RUNTIME_KEY) == runtime
 end
 
 local function stopKnownModules(reason: string)
@@ -75,7 +82,8 @@ if type(previous) == "table" and type(previous.Stop) == "function" then
 end
 
 local runtime = {
-	Version = "1.0",
+	Version = LOADER_VERSION,
+	Build = BUILD_TAG,
 	Running = true,
 	BaseUrl = BASE_URL,
 	Loaded = {},
@@ -107,18 +115,31 @@ if type(loadChunk) ~= "function" then
 end
 
 for _, fileName in ipairs(MODULES) do
-	if not runtime.Running then
+	if not isCurrent(runtime) then
 		break
 	end
 	local url = BASE_URL .. encodePath(fileName)
-	local ok, result = pcall(function()
+		.. "?vd_loader=" .. encodePath(LOADER_VERSION)
+		.. "&vd_build=" .. encodePath(BUILD_TAG)
+		.. "&vd_module=" .. encodePath(fileName)
+	local ok, result, stale = pcall(function()
 		local source = game:HttpGet(url)
+		if not isCurrent(runtime) then
+			return nil, true
+		end
 		local chunk, compileError = loadChunk(source, "@VD/" .. fileName)
 		if type(chunk) ~= "function" then
 			error(tostring(compileError or "loadstring returned no chunk"))
 		end
-		return chunk()
+		chunk()
+		if not isCurrent(runtime) then
+			return nil, true
+		end
+		return true, false
 	end)
+	if not isCurrent(runtime) or stale then
+		break
+	end
 	if ok then
 		table.insert(runtime.Loaded, fileName)
 		print("[VD UNIFIED][LOAD] " .. fileName)
@@ -127,11 +148,18 @@ for _, fileName in ipairs(MODULES) do
 		warn("[VD UNIFIED][ERROR] " .. fileName .. " | " .. tostring(result))
 	end
 	-- Let each module finish its initial bindings before the next module starts.
+	if not isCurrent(runtime) then
+		break
+	end
 	task.wait()
 end
 
-print(string.format(
-	"[VD UNIFIED][READY] loaded=%d errors=%d | StopVDUnified() to stop",
-	#runtime.Loaded,
-	#runtime.Errors
-))
+if isCurrent(runtime) then
+	print(string.format(
+		"[VD UNIFIED][READY] v%s build=%s loaded=%d errors=%d | StopVDUnified() to stop",
+		LOADER_VERSION,
+		BUILD_TAG,
+		#runtime.Loaded,
+		#runtime.Errors
+	))
+end
