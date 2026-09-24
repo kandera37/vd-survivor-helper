@@ -9,7 +9,7 @@
 local BASE_URL = "https://raw.githubusercontent.com/kandera37/vd-survivor-helper/refs/heads/main/violence-district/"
 local RUNTIME_KEY = "__VD_UNIFIED_LOADER_V1"
 local LOADER_VERSION = "1.1"
-local BUILD_TAG = "2026-09-23-visual-telemetry-fix"
+local BUILD_TAG = "2026-09-24-light-smoke-fog-route-repair-guard"
 
 local MODULES = {
 	-- Providers first: Assist publishes the generator/objective cache used by
