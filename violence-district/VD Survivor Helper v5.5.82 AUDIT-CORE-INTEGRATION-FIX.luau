@@ -1620,6 +1620,13 @@ local Config = {
 	-- never overrides the wind-up/closure discriminator, including point-blank.
 	abysswalkerCrouchSharedMinimumActiveDistance = 11.25,
 	abysswalkerCrouchCooldown = 0.58,
+	-- A replication gap can deliver the exact charged ACTIVE without its PREP.
+	-- This recovery is deliberately narrower than the paired sequence: it is
+	-- Abysswalker-only, point-blank, strongly aimed, and still respects every
+	-- defensive interaction/skill-check veto above.
+	abysswalkerCrouchDirectActiveFallbackEnabled = true,
+	abysswalkerCrouchDirectActiveFallbackDistance = 7.5,
+	abysswalkerCrouchDirectActiveFallbackFacing = 0.85,
 	-- The supplied 118907... -> 784320... sequence hit roughly 0.60 s after
 	-- ACTIVE while the old 220 ms hold had already released C. Keep the native
 	-- counter held through the bounded charged-dash impact window.
@@ -7036,8 +7043,7 @@ function ThreatMotionCore.InvalidateCertificate(
 		-- failed reforecast must not send the player back onto a straight native
 		-- heading while the already-fired line attack is still resolving.  The
 		-- breadcrumb is revalidated below before it can own movement again.
-		if threat.family == "VEIL_THROW"
-			and threat.motionType == "PROJECTILE_LINE"
+		if string.find(tostring(threat.family or ""), "VEIL", 1, true) ~= nil
 			and typeof(threat.routeDirection) == "Vector3" then
 			threat.lastVeilRouteDirection = threat.routeDirection
 			threat.lastVeilRouteClearance = threat.routeClearance
@@ -10273,6 +10279,35 @@ function ThreatController.MergeSignal(threat: any, id: string, metadata: any, tr
 		threat.kind = metadata.kind or threat.kind
 		threat.synthetic = false
 		threat.confirmedAimGuard = false
+		if metadata.phase == "ACTIVE" then
+			threat.activeAnimationId = id
+			threat.activeSignalAt = t
+			threat.lastExactActiveStartedAt = ThreatController.SignalStartedAt(
+				track,
+				playback
+			)
+		end
+		-- The route is retained, but the motion identity still advances to the
+		-- exact ACTIVE edge. Keeping the PREP key here made diagnostics and later
+		-- certificate checks report the wrong phase even though the route itself was
+		-- valid. Retarget the certificate without changing its geometry or impact
+		-- deadline; this is a zero-turn handoff, not a fresh forecast.
+		threat.motionAnimationId = id
+		threat.motionSignalPhase = metadata.phase
+		threat.motionSignalRevision = (threat.motionSignalRevision or 0) + 1
+		threat.motionSignalKey = string.format(
+			"%s|%s|%s",
+			tostring(threat.family or "UNKNOWN"),
+			tostring(threat.motionSignalPhase or threat.phase or "UNKNOWN"),
+			tostring(threat.motionAnimationId or "none")
+		)
+		threat.motionSignalTrack = track
+		threat.motionSignalPlaybackGeneration = type(playback) == "table"
+			and playback.generation
+			or nil
+		threat.routeCertificateSignalKey = threat.motionSignalKey
+		threat.routeCertificateSignalRevision = threat.motionSignalRevision
+		threat.routeCertificateMotionType = threat.motionType
 		threat.motionHoldUntil = math.max(
 			threat.motionHoldUntil or -math.huge,
 			confirmationHoldUntil
@@ -10851,6 +10886,49 @@ function ThreatController.TryAbysswalkerCrouch(
 		and prepAge >= Config.abysswalkerCrouchMinimumWindupAge
 		and closingGain <= Config.abysswalkerCrouchPairedMaximumClosingGain
 		and distance <= Config.abysswalkerCrouchPairedActiveMaximumDistance
+	-- A fast replication path can expose the exact charged ACTIVE without its
+	-- PREP. Recover only for an authoritative Abysswalker at point blank range;
+	-- the generic Killer classification is intentionally excluded even when it
+	-- shares this animation asset.
+	local directActiveFallback = false
+	if isActive
+		and id == Config.abysswalkerCrouchActiveId
+		and classToken == "abysswalker"
+		and knightConfirmed
+		and prep == nil
+		and Config.abysswalkerCrouchDirectActiveFallbackEnabled == true
+		and distance <= Config.abysswalkerCrouchDirectActiveFallbackDistance
+		and getFacingDot(root, localRoot)
+			>= Config.abysswalkerCrouchDirectActiveFallbackFacing then
+		local nonRepairLocked = CharacterController.HasNonRepairInteraction()
+		-- Fail closed if the GUI detector has not been bound yet; a missing
+		-- detector must never authorize a counter input during startup.
+		local skillCheckVisible = activeSkillCheckVisible == nil
+			or activeSkillCheckVisible()
+		local cooldownReady = t - State.telemetry.lastKnightCounterAt
+			>= Config.abysswalkerCrouchCooldown
+		directActiveFallback = not nonRepairLocked
+			and not skillCheckVisible
+			and cooldownReady
+		if not directActiveFallback then
+			Diagnostics.Push(
+				"CROUCH_COUNTER_SKIPPED",
+				string.format(
+					"killer=%s class=%s id=%s d=%.2f facing=%.2f skillCheck=%s nonRepair=%s cooldownReady=%s reason=direct-active-fallback-veto action=no-C",
+					model.Name,
+					tostring(classInfo.class or "Unknown"),
+					id,
+					distance,
+					getFacingDot(root, localRoot),
+					tostring(skillCheckVisible),
+					tostring(nonRepairLocked),
+					tostring(cooldownReady)
+				),
+				"crouch-counter-direct-fallback-veto-" .. model.Name,
+				0.12
+			)
+		end
+	end
 	-- A live Player.SelectedKiller=Abysswalker is authoritative even when the
 	-- shared animation resolver deliberately labels the family as literal Killer.
 	-- In that case ACTIVE may still counter if polling missed PREP. A genuinely
@@ -10876,7 +10954,7 @@ function ThreatController.TryAbysswalkerCrouch(
 		or nil
 	local directKnightAuthority = typeof(selectedKiller) == "string"
 		and containsToken(selectedKiller, {"abysswalker", "knight"})
-	if not pairedPostureAuthorized then
+	if not pairedPostureAuthorized and not directActiveFallback then
 		-- ACTIVE terminates this exact observation. Keeping a rejected rapid pair
 		-- armed allowed UpdateArmedCrouchCounter to emit C after the ordinary M1 had
 		-- already started, which is the false crouch seen in the supplied match.
@@ -10900,6 +10978,55 @@ function ThreatController.TryAbysswalkerCrouch(
 			0.15
 		)
 		return false
+	end
+	if directActiveFallback then
+		State.crouchCounterPrepByModel[model] = nil
+		ActionArbiter.CancelCounterReservation(model)
+		local emitted, emitReason = ActionArbiter.EmitCounter(
+			model,
+			id,
+			Config.abysswalkerCrouchHold,
+			false
+		)
+		if not emitted then
+			Diagnostics.Push(
+				"ABYSSWALKER_CROUCH_FAILED",
+				string.format(
+					"killer=%s class=%s id=%s d=%.2f facing=%.2f reason=%s action=fallback-to-dodge",
+					model.Name,
+					tostring(classInfo.class or "Unknown"),
+					id,
+					distance,
+					getFacingDot(root, localRoot),
+					tostring(emitReason)
+				),
+				"abysswalker-crouch-direct-fallback-failed",
+				0.20
+			)
+			return false
+		end
+		State.telemetry.lastKnightCounterAt = t
+		local activeThreat = State.activeThreat
+		if activeThreat and activeThreat.killerModel == model then
+			ThreatController.Release("direct abysswalker active fallback sent")
+		else
+			MovementWriter.Clear(OWNER.THREAT, "direct abysswalker active fallback sent")
+		end
+		Diagnostics.Push(
+			"CROUCH_COUNTER_DIRECT_FALLBACK",
+			string.format(
+				"killer=%s class=%s id=%s d=%.2f facing=%.2f key=C hold=%.3f prep=none action=key-down-exact-active-fallback",
+				model.Name,
+				tostring(classInfo.class or "Unknown"),
+				id,
+				distance,
+				getFacingDot(root, localRoot),
+				Config.abysswalkerCrouchHold
+			),
+			"crouch-counter-direct-fallback",
+			0.08
+		)
+		return true
 	end
 	Diagnostics.Push(
 		"CROUCH_COUNTER_ACTIVE_AUTHORIZED",
@@ -24242,7 +24369,8 @@ local function runSelfTests(): ()
 		and veilAimA.pendingAimFacing <= 0.62
 		and veilAimB.pendingAimFacing <= 0.62
 	tests.veilExactActiveRecertification =
-		veilThrowActive.preserveExistingRouteOnConfirm == false
+		veilThrowActive.preserveExistingRouteOnConfirm == true
+		and veilThrowActive.confirmationHold == nil
 		and veilThrowActive.minimumHold >= 0.70
 		and VEIL_EXACT_PROJECTILE_PROFILE.exactLineRouteAuthority == true
 		and VEIL_EXACT_PROJECTILE_PROFILE.minimumLateral >= 8.0
@@ -24429,6 +24557,12 @@ local function runSelfTests(): ()
 		and Config.abysswalkerCrouchEarlyMaximumClosingGain <= 2.25
 		and Config.abysswalkerCrouchPairedMaximumClosingGain <= 2.50
 		and Config.abysswalkerCrouchPrepMinimumFacing >= 0.80
+	tests.crouchCounterDirectActiveFallbackNarrow =
+		Config.abysswalkerCrouchDirectActiveFallbackEnabled == true
+		and Config.abysswalkerCrouchActiveId == "78432063483146"
+		and Config.abysswalkerCrouchDirectActiveFallbackDistance <= 7.5
+		and Config.abysswalkerCrouchDirectActiveFallbackFacing >= 0.85
+		and Config.abysswalkerCrouchLiteralKillerRequiresPrep == true
 	tests.abysswalkerSlowPressureBounded =
 		Config.abysswalkerSlowPressureEnabled == true
 		and Config.abysswalkerSlowPressureWalkRatio <= 0.82
