@@ -386,9 +386,15 @@ local function cleanupOldVisuals()
 			if ok then
 				for _, object in ipairs(children) do
 					table.insert(queue, object)
-					if runtime.running and _G[KEY] == runtime
-						and (object:IsA("Highlight") or object:IsA("BillboardGui"))
-						and names[object.Name] and object:GetAttribute("VDRunId") ~= RUN_ID then object:Destroy() end
+					if runtime.running and _G[KEY] == runtime then
+						local oldAssistVisual = names[object.Name]
+							or (object.Name:find("VDAssistWindowSelection_", 1, true) ~= nil)
+						if (object:IsA("Highlight") or object:IsA("BillboardGui")
+							or object:IsA("SelectionBox") or object:IsA("BoxHandleAdornment"))
+							and oldAssistVisual and object:GetAttribute("VDRunId") ~= RUN_ID then
+							object:Destroy()
+						end
+					end
 					processed += 1
 					if processed % 120 == 0 then RunService.Heartbeat:Wait() end
 				end
@@ -1689,20 +1695,96 @@ local function removeRoute(root)
 	runtime.routes[root] = nil
 end
 
-local function routeHighlightHost(root, kind, part)
-	-- VaultTrigger/WindowPoint parts are usually invisible interaction hitboxes;
-	-- adorning those makes the window aura disappear.  Keep the complete Window
-	-- model as the adornee.  For pallets a concrete visible anchor is fine, but
-	-- fall back to the model when the chosen anchor is transparent.
-	if kind == "Window" then return root end
-	if part and part:IsA("BasePart") and part.Transparency < 0.98 then
-		return part
+local function windowHasVisibleGeometry(root)
+	if not root or not root:IsA("Model") then return false end
+	for _, object in ipairs(root:GetDescendants()) do
+		if object:IsA("BasePart") and object.Transparency < 0.98 then
+			local name = normalize(object.Name)
+			if name ~= "vaulttrigger" and name ~= "vaultpoint"
+				and not name:find("trigger", 1, true)
+				and not name:find("hitbox", 1, true)
+				and not name:find("invis", 1, true)
+				and not name:find("prompt", 1, true) then
+				return true
+			end
+		end
 	end
+	return false
+end
+
+local function routeHighlightHost(root, kind, part)
+	-- Pallets are multi-part models, so adorn the model to cover both boards.
+	-- Windows normally have visible Part/Bottom geometry and an invisible
+	-- VaultTrigger; use the model when that geometry exists and a marker only
+	-- while a streamed variant exposes no visible geometry yet.
+	if kind == "Window" and not windowHasVisibleGeometry(root) then return part end
 	return root
 end
 
+-- Workspace also contains lobby and pooled map clones. Route discovery must
+-- stay inside the active Map or those copies become false route auras.
+local function isActiveMapRoute(root)
+	if not root or not root:IsDescendantOf(Workspace) then return false end
+	local map = Workspace:FindFirstChild("Map")
+	return map ~= nil and root:IsDescendantOf(map)
+end
+
+local function ensureWindowSelection(part)
+	local name = "VDAssistWindowSelection_" .. RUN_ID
+	local existing = part:FindFirstChild(name)
+	if existing and existing:IsA("SelectionBox")
+		and existing:GetAttribute("VDRunId") == RUN_ID then
+		existing.Adornee = part
+		existing.Visible = runtime.visible
+		return existing
+	end
+	local selection = Instance.new("SelectionBox")
+	selection.Name = name
+	selection:SetAttribute("VDRunId", RUN_ID)
+	selection.Adornee = part
+	selection.Color3 = COLORS.window
+	selection.SurfaceColor3 = COLORS.window
+	selection.SurfaceTransparency = 1
+	selection.LineThickness = 0.08
+	selection.Visible = runtime.visible
+	selection.Parent = part
+	return selection
+end
+
+local function ensureRouteVisual(root, kind, part)
+	if kind == "Window" and routeHighlightHost(root, kind, part) == part
+		and part and part:IsA("BasePart") then
+		return ensureWindowSelection(part)
+	end
+	return ensureHighlight(root, "VDRestoredRouteAura")
+end
+
+local function applyRouteVisual(entry, color, fillTransparency, outlineTransparency, enabled)
+	local visual = entry and entry.highlight
+	if visual and visual:IsA("SelectionBox") then
+		if entry.visualColor ~= color then
+			entry.visualColor = color
+			visual.Color3 = color
+			visual.SurfaceColor3 = color
+		end
+		if visual.Visible ~= enabled then visual.Visible = enabled end
+		return
+	end
+	applyHighlight(entry, color, fillTransparency, outlineTransparency, enabled)
+end
+
+local function disableRouteVisual(entry)
+	local visual = entry and entry.highlight
+	if not visual then return end
+	if visual:IsA("SelectionBox") then
+		visual.Visible = false
+	else
+		visual.Enabled = false
+	end
+end
+
 local function addRoute(root, kind, partOverride)
-	if not root then return end
+	if not root or not isActiveMapRoute(root) then return end
 	local now = os.clock()
 	local lastAdd = runtime.routeAddAt[root]
 	if lastAdd and now - lastAdd < 0.12 and runtime.routes[root] then return end
@@ -1728,13 +1810,14 @@ local function addRoute(root, kind, partOverride)
 		existing.kind = kind
 		if existing.highlightHost ~= host then
 			if existing.highlight then existing.highlight:Destroy() end
-			existing.highlight = ensureHighlight(host, "VDRestoredRouteAura")
+			existing.highlight = ensureRouteVisual(root, kind, part)
 			existing.highlightHost = host
 			existing.visualEnabled = nil
+			existing.visualColor = nil
 		end
 		return
 	end
-	local highlight = ensureHighlight(host, "VDRestoredRouteAura")
+	local highlight = ensureRouteVisual(root, kind, part)
 	runtime.routes[root] = {
 		root = root,
 		part = part,
@@ -2504,13 +2587,13 @@ local function updateRoutes()
 				entry.part = entry.kind == "Pallet" and palletAnchor(model) or windowAnchor(model)
 			end
 			if not entry.part or not entry.part:IsA("BasePart") or not entry.part.Parent then
-				if entry.highlight then entry.highlight.Enabled = false end
+				disableRouteVisual(entry)
 				entry.visualEnabled = false
 			else
 				local desiredHost = routeHighlightHost(model, entry.kind, entry.part)
 				if not entry.highlight or not entry.highlight.Parent or entry.highlightHost ~= desiredHost then
 					if entry.highlight then entry.highlight:Destroy() end
-					entry.highlight = ensureHighlight(desiredHost, "VDRestoredRouteAura")
+					entry.highlight = ensureRouteVisual(model, entry.kind, entry.part)
 					entry.highlightHost = desiredHost
 					entry.visualColor = nil
 					entry.visualFill = nil
@@ -2526,9 +2609,12 @@ local function updateRoutes()
 				if entry.kind == "Pallet" and palletBroken(model) then visible = false end
 				local color = entry.kind == "Pallet" and COLORS.pallet
 					or (entry.kind == "Window" and COLORS.window or COLORS.custom)
-				local fill = entry.kind == "Pallet" and 0.91 or 0.92
-				local outline = entry.kind == "Pallet" and 0.16 or 0.14
-				applyHighlight(entry, color, fill, outline, visible)
+				-- Route auras must be readable at map distance. 0.91 left only a
+				-- faint five-percent fill on the pallet meshes, which looked like a
+				-- partial highlight even though the model was correctly adorned.
+				local fill = entry.kind == "Pallet" and 0.68 or 0.78
+				local outline = entry.kind == "Pallet" and 0.04 or 0.06
+				applyRouteVisual(entry, color, fill, outline, visible)
 			end
 		end
 	end
@@ -2599,7 +2685,11 @@ local function hideAllVisualsImmediate()
 	end
 	for _, bucket in ipairs({runtime.generators, runtime.exits, runtime.routes}) do
 		for _, entry in pairs(bucket) do
-			if entry.highlight then entry.highlight.Enabled = false end
+			if bucket == runtime.routes then
+				disableRouteVisual(entry)
+			elseif entry.highlight then
+				entry.highlight.Enabled = false
+			end
 			if entry.billboard then entry.billboard.Enabled = false end
 			entry.visualEnabled = false
 			entry.billboardEnabled = false

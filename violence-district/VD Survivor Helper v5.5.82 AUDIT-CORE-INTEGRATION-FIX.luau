@@ -143,8 +143,8 @@ local INSTANCE_ID =
 -- 2. Constants
 ---------------------------------------------------------------------
 
-local VERSION = "5.5.82-AUDITCORE1"
-local SCRIPT_TAG = "VD 360 V5.5.82-AUDITCORE1"
+local VERSION = "5.5.82-AUDITCORE2"
+local SCRIPT_TAG = "VD 360 V5.5.82-AUDITCORE2"
 
 SingletonMarker:SetAttribute("Version", VERSION)
 SingletonMarker:SetAttribute("OwnsZombieMovement", true)
@@ -327,6 +327,12 @@ local Config = {
 	threatDistanceKeeperEmergencyDistance = 8.0,
 	threatDistanceKeeperEmergencyMinimumFacing = 0.15,
 	threatDistanceKeeperEmergencyMinimumApproach = -0.25,
+	-- At repair lock, velocity samples may point away during a fast Slasher rush.
+	-- A close, facing Slasher may authorize the existing bounded native exit pulse;
+	-- route geometry and the separate skill-check/interaction gates still apply.
+	slasherRepairAimGuardEnabled = true,
+	slasherRepairAimGuardDistance = 10.0,
+	slasherRepairAimGuardFacing = 0.88,
 	threatDistanceKeeperLateralWeight = 7.0,
 	threatDistanceKeeperAwayWeight = 34.0,
 	threatDistanceKeeperPostHitBlock = 0.90,
@@ -1704,7 +1710,7 @@ local AttackCatalog = {
 	-- entire PREP tracking the survivor.  Keeping the PREP world vector let two
 	-- arrows hit after 30-35 studs of movement.  ACTIVE must atomically recertify
 	-- against Veil's current line instead of preserving the now-predictable side.
-	["86266790353635"] = {family="VEIL_THROW", phase="ACTIVE", kind="VEIL_THROW", maxDistance=120.0, duration=1.35, safeDistance=120.0, speed=36.0, lateral=36.0, away=1.0, minFacing=0.18, ignoreSafeDistance=true, minimumHold=0.72, requireAimedOrApproaching=true, aimedFacing=0.82, minimumApproach=999.0, preserveExistingRouteOnConfirm=false},
+	["86266790353635"] = {family="VEIL_THROW", phase="ACTIVE", kind="VEIL_THROW", maxDistance=120.0, duration=1.35, safeDistance=120.0, speed=36.0, lateral=36.0, away=1.0, minFacing=0.18, ignoreSafeDistance=true, minimumHold=0.72, requireAimedOrApproaching=true, aimedFacing=0.82, minimumApproach=999.0, preserveExistingRouteOnConfirm=true},
 	-- Fresh trace: this appeared only 60 ms before damage. It is useful as a
 	-- confirmation of an already-running Veil aim/PREP episode, never as a new
 	-- movement trigger on its own.
@@ -2973,7 +2979,16 @@ function CharacterController.CanRequestRepairThreatEscape(
 		return false, "not-confirmed-active"
 	end
 	local family = tostring(threat.family or "")
-	local veilThreat = family == "VEIL_THROW"
+	-- A Veil distance episode is created before the exact projectile PREP.  The
+	-- old gate only recognized the later VEIL_* family names, so a generator
+	-- repair lock stayed frozen while an aimed Veil was still 35-50 studs away.
+	-- Use the authoritative resolved class as well; this does not broaden the
+	-- gate to arbitrary killers or generic proximity guards.
+	local resolvedClass = string.lower(
+		tostring(threat.killerClass or "")
+	):gsub("[^%w]", "")
+	local veilThreat = resolvedClass == "veil"
+		or family == "VEIL_THROW"
 		or family == "VEIL_DELAYED"
 		or family == "VEIL_WALL_ARROW_AIM"
 	if Config.repairThreatEscapeVeilOnly and not veilThreat then
@@ -4938,7 +4953,11 @@ local function selectRepairThreatEscapeDirection(
 	threat: any
 ): (Vector3, number, string)
 	local family = tostring(threat and threat.family or "")
-	if family == "VEIL_THROW"
+	local classToken = string.lower(
+		tostring(threat and threat.killerClass or "")
+	):gsub("[^%w]", "")
+	if classToken == "veil"
+		or family == "VEIL_THROW"
 		or family == "VEIL_DELAYED"
 		or family == "VEIL_WALL_ARROW_AIM" then
 		local direction, clearance = selectVeilRepairEscapeDirection(
@@ -7013,6 +7032,17 @@ function ThreatMotionCore.InvalidateCertificate(
 	threat.routeCertificateInvalidReason = reason
 	threat.predictiveLocked = false
 	if clearRoute == true then
+		-- Keep one short-lived breadcrumb for Veil's exact projectile only.  A
+		-- failed reforecast must not send the player back onto a straight native
+		-- heading while the already-fired line attack is still resolving.  The
+		-- breadcrumb is revalidated below before it can own movement again.
+		if threat.family == "VEIL_THROW"
+			and threat.motionType == "PROJECTILE_LINE"
+			and typeof(threat.routeDirection) == "Vector3" then
+			threat.lastVeilRouteDirection = threat.routeDirection
+			threat.lastVeilRouteClearance = threat.routeClearance
+			threat.lastVeilRouteAt = now()
+		end
 		threat.routeDirection = nil
 		threat.routeLocked = false
 		-- Do not let a rejected exact phase report the previous guard's separation
@@ -8174,6 +8204,58 @@ function ThreatMotionCore.TryWallContinuation(
 		predicted.separation, predicted.requiredSeparation
 	), "wall-recertified-" .. tostring(threat.episodeId), 0.25)
 	return true, false
+end
+
+function ThreatMotionCore.TryRetainVeilProjectileRoute(threat: any): boolean
+	if not threat
+		or threat.family ~= "VEIL_THROW"
+		or threat.motionType ~= "PROJECTILE_LINE"
+		or not State.root
+		or typeof(threat.lastVeilRouteDirection) ~= "Vector3" then
+		return false
+	end
+	local t = now()
+	if t - (threat.lastVeilRouteAt or -math.huge) > 0.36
+		or t >= (threat.motionHoldUntil or -math.huge) then
+		return false
+	end
+	local blocked, clearance = RoutePlanner.IsCurrentRouteBlocked(
+		threat.lastVeilRouteDirection,
+		1.50,
+		5.0
+	)
+	if blocked or clearance < 2.25 then
+		return false
+	end
+	threat.routeDirection = threat.lastVeilRouteDirection
+	threat.routeLocked = true
+	threat.predictiveLocked = true
+	threat.routeClearance = clearance
+	threat.routeSafeLength = clearance
+	threat.routeCertificateValid = true
+	threat.routeCertificateSignalKey = threat.motionSignalKey
+	threat.routeCertificateSignalRevision = threat.motionSignalRevision
+	threat.routeCertificateImpactAt = threat.motionImpactAt
+	threat.routeCertificateMotionType = threat.motionType
+	threat.routeCertificateValidUntil = math.min(
+		threat.motionHoldUntil or (t + 0.18),
+		t + 0.18
+	)
+	threat.routeCertificateInvalidReason = nil
+	threat.routePending = false
+	threat.motionObserveOnlyNoRoute = false
+	Diagnostics.Push(
+		"VEIL_PROJECTILE_ROUTE_RETAINED",
+		string.format(
+			"episode=%d clear=%.2f remaining=%.3f action=bounded-revalidated-lateral-route",
+			threat.episodeId,
+			clearance,
+			math.max(0, (threat.motionHoldUntil or t) - t)
+		),
+		"veil-projectile-route-retained-" .. tostring(threat.episodeId),
+		0.10
+	)
+	return true
 end
 
 function ThreatMotionCore.HistoricalApproach(
@@ -10152,8 +10234,18 @@ function ThreatController.MergeSignal(threat: any, id: string, metadata: any, tr
 	local incomingProfile = predictiveFamilyProfile(
 		tostring(metadata.family or threat.family), tostring(id)
 	)
+	-- Veil's projectile PREP and ACTIVE IDs share the same exact line profile.
+	-- ACTIVE is a late confirmation; dropping the already certified PREP tangent
+	-- at this handoff produced a straight native run until the server hit.
+	local sameVeilProjectileProfile = previousMotionPhase == "PREP"
+		and metadata.phase == "ACTIVE"
+		and tostring(metadata.family or "") == "VEIL_THROW"
+		and tostring(id) == "86266790353635"
+		and threat.motionProfile == incomingProfile
+		and metadata.preserveExistingRouteOnConfirm == true
 	local preserveConfirmedRoute = threat.motionProfile == incomingProfile
-		and not (previousMotionPhase == "PREP" and metadata.phase == "ACTIVE")
+		and (not (previousMotionPhase == "PREP" and metadata.phase == "ACTIVE")
+			or sameVeilProjectileProfile)
 		and threat.routeAuthorityKind ~= "EMERGENCY"
 		and ThreatMotionCore.CertificateMatches(threat, t)
 		and (
@@ -14213,6 +14305,36 @@ function ThreatController.TryDistanceKeeper(): boolean
 		approach,
 		isVeil
 	)
+	local repairAimGuard = false
+	if Config.slasherRepairAimGuardEnabled == true
+		and classToken == "slasher"
+		and interactionLocked
+		and CharacterController.IsRepairing()
+		and distance <= Config.slasherRepairAimGuardDistance
+		and facing >= Config.slasherRepairAimGuardFacing then
+		local skillCheckVisible = activeSkillCheckVisible
+			and activeSkillCheckVisible()
+			or false
+		local otherInteraction =
+			CharacterController.HasNonRepairInteraction()
+		repairAimGuard = not skillCheckVisible
+			and not otherInteraction
+	end
+	if repairAimGuard then
+		killerCommitted = true
+		Diagnostics.Push(
+			"SLASHER_REPAIR_AIM_GUARD",
+			string.format(
+				"killer=%s d=%.2f facing=%.2f approach=%+.2f action=authorize-bounded-repair-exit skillCheck=false",
+				model.Name,
+				distance,
+				facing,
+				approach
+			),
+			"slasher-repair-aim-" .. model.Name,
+			0.15
+		)
+	end
 	if abysswalkerSlowPressure then
 		killerCommitted = true
 	end
@@ -15688,6 +15810,14 @@ function ThreatController.Update(): ()
 	end
 	if threat.transactionalHandoffPending == true
 		and threat.routeDirection == nil then
+		if ThreatMotionCore.TryRetainVeilProjectileRoute(threat) then
+			threat.transactionalHandoffPending = false
+			threat.transactionalHandoffRetryAt = nil
+			threat.transactionalHandoffDeadline = nil
+		end
+	end
+	if threat.transactionalHandoffPending == true
+		and threat.routeDirection == nil then
 		MovementWriter.Clear(
 			OWNER.THREAT,
 			"exact handoff awaiting fresh ray budget"
@@ -15711,6 +15841,9 @@ function ThreatController.Update(): ()
 		return
 	end
 	if not threat.routeDirection then
+		if ThreatMotionCore.TryRetainVeilProjectileRoute(threat) then
+			return
+		end
 		if threat.motionObserveOnlyNoRoute == true
 			and threat.motionRouteAbandonedSignalKey ~= nil
 			and threat.motionRouteAbandonedSignalKey

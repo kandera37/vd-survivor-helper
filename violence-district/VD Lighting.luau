@@ -1,5 +1,5 @@
 --!strict
--- VD ASSIST LIGHTING v1.5
+-- VD ASSIST LIGHTING v1.6
 --
 -- Applies the client visibility boost only while the local player has a live
 -- Survivor/Killer team. Lobby lighting is left alone. During a match, fog,
@@ -53,6 +53,7 @@ type Runtime = {
 	matchActive: boolean,
 	connections: {RBXScriptConnection},
 	camera: Camera?,
+	cameraPostConnection: RBXScriptConnection?,
 	boost: ColorCorrectionEffect?,
 	lastEnsureAt: number,
 	lastLogAt: number,
@@ -70,6 +71,8 @@ type NativeFogState = {
 	FogEnd: number,
 	atmospheres: {[Atmosphere]: AtmosphereState},
 	emitters: {[Instance]: boolean},
+	postEffects: {[Instance]: boolean},
+	profile: {[string]: any},
 }
 
 local runtime: Runtime = {
@@ -78,6 +81,7 @@ local runtime: Runtime = {
 	matchActive = false,
 	connections = {},
 	camera = nil,
+	cameraPostConnection = nil,
 	boost = nil,
 	lastEnsureAt = -math.huge,
 	lastLogAt = -math.huge,
@@ -106,7 +110,7 @@ local function log(message: string)
 		return
 	end
 	runtime.lastLogAt = now
-	print("[VD ASSIST LIGHT v1.5] " .. message)
+	print("[VD ASSIST LIGHT v1.6] " .. message)
 end
 
 local function removeOwnedBoost()
@@ -156,6 +160,52 @@ local function isSmokeEffect(instance: Instance): boolean
 		or string.find(name, "fog", 1, true) ~= nil
 end
 
+local function isPostEffect(instance: Instance): boolean
+	return instance:IsA("ColorCorrectionEffect")
+		or instance:IsA("BlurEffect")
+		or instance:IsA("BloomEffect")
+		or instance:IsA("DepthOfFieldEffect")
+		or instance:IsA("SunRaysEffect")
+end
+
+-- This is the game's own intermission profile. The round map script can write
+-- a dark map profile again after we start, so the values are reasserted while
+-- the match is active and restored from the first observed state on exit.
+local LOBBY_PROFILE = {
+	Brightness = 3,
+	ExposureCompensation = 0,
+	Ambient = Color3.fromRGB(0, 0, 0),
+	OutdoorAmbient = Color3.fromRGB(65, 72, 53),
+	ColorShift_Top = Color3.fromRGB(255, 192, 146),
+	ColorShift_Bottom = Color3.fromRGB(0, 0, 0),
+	ClockTime = 17,
+	EnvironmentDiffuseScale = 0.222,
+	EnvironmentSpecularScale = 1,
+}
+
+local function suppressPostEffect(effect: Instance)
+	local snapshot = nativeFog
+	if not snapshot or not isPostEffect(effect) or effect == runtime.boost then return end
+	if snapshot.postEffects[effect] == nil then
+		local ok, enabled = pcall(function() return (effect :: any).Enabled end)
+		if not ok then return end
+		snapshot.postEffects[effect] = enabled
+	end
+	pcall(function() (effect :: any).Enabled = false end)
+end
+
+local function applyLobbyProfile()
+	local snapshot = nativeFog
+	if not snapshot then return end
+	for property, value in pairs(LOBBY_PROFILE) do
+		if snapshot.profile[property] == nil then
+			local ok, previous = pcall(function() return (Lighting :: any)[property] end)
+			if ok then snapshot.profile[property] = previous end
+		end
+		pcall(function() (Lighting :: any)[property] = value end)
+	end
+end
+
 local function suppressSmokeEffect(emitter: Instance)
 	local snapshot = nativeFog
 	if not snapshot or not isSmokeEffect(emitter) then return end
@@ -180,6 +230,8 @@ local function applyFogRemoval()
 			FogEnd = Lighting.FogEnd,
 			atmospheres = {},
 			emitters = {},
+			postEffects = {},
+			profile = {},
 		}
 	end
 	local snapshot = nativeFog
@@ -188,6 +240,9 @@ local function applyFogRemoval()
 	pcall(function() Lighting.FogStart = 0 end)
 	pcall(function() Lighting.FogEnd = CONFIG.fogEnd end)
 	for _, child in ipairs(Lighting:GetChildren()) do
+		if isPostEffect(child) then
+			suppressPostEffect(child)
+		end
 		if child:IsA("Atmosphere") then
 			rememberAtmosphere(child)
 			pcall(function()
@@ -197,6 +252,13 @@ local function applyFogRemoval()
 			end)
 		end
 	end
+	local camera = Workspace.CurrentCamera
+	if camera then
+		for _, child in ipairs(camera:GetChildren()) do
+			suppressPostEffect(child)
+		end
+	end
+	applyLobbyProfile()
 	if needsWorkspaceScan then
 		for _, descendant in ipairs(Workspace:GetDescendants()) do
 			if isSmokeEffect(descendant) then
@@ -231,6 +293,14 @@ local function restoreFog()
 		if emitter.Parent then
 			pcall(function() (emitter :: any).Enabled = wasEnabled end)
 		end
+	end
+	for effect, wasEnabled in pairs(snapshot.postEffects) do
+		if effect.Parent then
+			pcall(function() (effect :: any).Enabled = wasEnabled end)
+		end
+	end
+	for property, value in pairs(snapshot.profile) do
+		pcall(function() (Lighting :: any)[property] = value end)
 	end
 end
 
@@ -300,11 +370,11 @@ local function setEnabled(enabled: boolean)
 	runtime.enabled = enabled
 	if enabled then
 		syncWorldState("toggle-on")
-		print("[VD ASSIST LIGHT v1.5][STATE] ON | active match only")
+		print("[VD ASSIST LIGHT v1.6][STATE] ON | lobby profile active in match")
 	else
 		removeOwnedBoost()
 		restoreFog()
-		print("[VD ASSIST LIGHT v1.5][STATE] OFF | native fog restored")
+		print("[VD ASSIST LIGHT v1.6][STATE] OFF | native lighting restored")
 	end
 end
 
@@ -317,11 +387,15 @@ local function stop()
 	removeOwnedBoost()
 	restoreFog()
 	disconnectList(runtime.connections)
+	if runtime.cameraPostConnection then
+		pcall(function() runtime.cameraPostConnection:Disconnect() end)
+		runtime.cameraPostConnection = nil
+	end
 	runtime.camera = nil
 	if rawget(_G, KEY) == runtime then
 		rawset(_G, KEY, nil)
 	end
-	print("[VD ASSIST LIGHT v1.5][STOP] owned boost removed | native fog restored")
+	print("[VD ASSIST LIGHT v1.6][STOP] owned effects removed | native lighting restored")
 end
 
 runtime.Stop = stop
@@ -336,6 +410,35 @@ end))
 remember(Workspace.DescendantAdded:Connect(function(descendant)
 	if runtime.running and runtime.enabled and runtime.matchActive then
 		suppressSmokeEffect(descendant)
+	end
+end))
+
+remember(Lighting.ChildAdded:Connect(function(child)
+	if runtime.running and runtime.enabled and runtime.matchActive then
+		suppressPostEffect(child)
+	end
+end))
+
+local boundPostCamera: Camera? = nil
+local function bindCameraPostEffects(camera: Camera?)
+	if boundPostCamera == camera then return end
+	if runtime.cameraPostConnection then
+		pcall(function() runtime.cameraPostConnection:Disconnect() end)
+		runtime.cameraPostConnection = nil
+	end
+	boundPostCamera = camera
+	if not camera then return end
+	runtime.cameraPostConnection = camera.ChildAdded:Connect(function(child)
+		if runtime.running and runtime.enabled and runtime.matchActive then
+			suppressPostEffect(child)
+		end
+	end)
+end
+bindCameraPostEffects(Workspace.CurrentCamera)
+
+remember(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+	if runtime.running then
+		bindCameraPostEffects(Workspace.CurrentCamera)
 	end
 end))
 
@@ -361,7 +464,7 @@ remember(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	elseif input.KeyCode == Enum.KeyCode.F11 then
 		if runtime.enabled and runtime.matchActive then
 			syncWorldState("manual-F11")
-			print("[VD ASSIST LIGHT v1.5][MANUAL] match boost repaired")
+			print("[VD ASSIST LIGHT v1.6][MANUAL] lobby profile repaired")
 		end
 	end
 end))
@@ -371,7 +474,7 @@ syncWorldState("startup")
 local camera = Workspace.CurrentCamera
 local cameraName = camera and camera:GetFullName() or "none"
 print(string.format(
-	"[VD ASSIST LIGHT v1.5][READY] match-only camera boost | enabled=%s match=%s camera=%s brightness=%.2f fogAndSmokeRemoval=match-only | F9 toggle | F11 repair",
+	"[VD ASSIST LIGHT v1.6][READY] lobby-profile match lighting | enabled=%s match=%s camera=%s brightness=%.2f fogSmokePostEffects=match-only | F9 toggle | F11 repair",
 	tostring(runtime.enabled),
 	tostring(runtime.matchActive),
 	cameraName,
