@@ -89,6 +89,12 @@ local CONFIG = {
 	-- Route discovery is incremental. Keep one batch under a small wall-clock
 	-- budget so a streamed map cannot monopolize a render/heartbeat step.
 	scanBatchBudget = 0.002,
+	-- A streamed map can create the generator model before its progress
+	-- attributes/tags arrive. Probe the shallow, known generator container at a
+	-- low rate so the initial async scan cannot leave the data API empty until
+	-- the 180-second safety rescan.
+	knownGeneratorProbeInterval = 2.0,
+	initialEmptyIndexRetryDelay = 0.65,
 
 	-- VD normally spawns two more physical generators than survivors must finish.
 	-- Use objective count, not every remaining model, for late-game and exit logic.
@@ -178,6 +184,8 @@ local state = {
 	scanInProgress = false,
 	lastRouteCount = -1,
 	lastGeneratorCount = -1,
+	nextKnownGeneratorProbeAt = -math.huge,
+	initialEmptyIndexRetryScheduled = false,
 	controlPaused = false,
 	exitGuiCacheAt = -math.huge,
 	exitGuiVisible = false,
@@ -1524,6 +1532,59 @@ local function addGeneratorCandidate(instance)
 	end
 end
 
+local function indexKnownGeneratorContainers()
+	-- The supplied map uses Workspace.Map.Generators.Generator. Keep this
+	-- fallback deliberately shallow: it catches late replication without
+	-- reintroducing a per-frame Workspace:GetDescendants() scan.
+	local map = Workspace:FindFirstChild("Map")
+	if not map then return 0 end
+	local indexed = 0
+	local containers = {}
+	for _, name in ipairs({"Generators", "NewGenerators", "GeneratorContainer"}) do
+		local container = map:FindFirstChild(name)
+		if container then table.insert(containers, container) end
+	end
+	local function probe(parent)
+		local ok, children = pcall(function() return parent:GetChildren() end)
+		if not ok or type(children) ~= "table" then return end
+		for _, child in ipairs(children) do
+			local childName = normalize(child.Name)
+			if child:IsA("Model") or child:IsA("BasePart") then
+				if hasGeneratorSignal(child)
+					or childName:find("generator", 1, true)
+					or childName == "gen" then
+					local childRoot = generatorRootFrom(child)
+					local before = childRoot and runtime.generators[childRoot] or nil
+					addGeneratorCandidate(child)
+					if childRoot and not before then indexed += 1 end
+				end
+				-- Some streamed variants insert one folder/model between the
+				-- container and the physical generator. One extra level is enough.
+				if child:IsA("Model") or child:IsA("Folder") then
+					local nestedOk, nested = pcall(function() return child:GetChildren() end)
+					if nestedOk and type(nested) == "table" then
+						for _, grandchild in ipairs(nested) do
+							local grandName = normalize(grandchild.Name)
+							if grandchild:IsA("Model") or grandchild:IsA("BasePart") then
+								if hasGeneratorSignal(grandchild)
+									or grandName:find("generator", 1, true)
+									or grandName == "gen" then
+									local nestedRoot = generatorRootFrom(grandchild)
+									local beforeNested = nestedRoot and runtime.generators[nestedRoot] or nil
+									addGeneratorCandidate(grandchild)
+									if nestedRoot and not beforeNested then indexed += 1 end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	for _, container in ipairs(containers) do probe(container) end
+	return indexed
+end
+
 local function addExitCandidate(instance)
 	local root = exitRootFrom(instance)
 	if root and not runtime.exits[root] then
@@ -2040,6 +2101,22 @@ local function scanWorkspace()
 				"[VD ASSIST v10.0][INDEX] generators=%d routes=%d",
 				generatorCount, routeCount
 			))
+		end
+		-- Initial scans can legitimately finish before streamed generator models
+		-- exist. Retry once after the map settles instead of waiting for the long
+		-- safety rescan or forcing a full hierarchy walk every frame.
+		if generatorCount == 0
+			and Workspace:FindFirstChild("Map") ~= nil
+			and not state.initialEmptyIndexRetryScheduled then
+			state.initialEmptyIndexRetryScheduled = true
+			task.delay(CONFIG.initialEmptyIndexRetryDelay, function()
+				if not runtime.running or _G[KEY] ~= runtime then return end
+				state.initialEmptyIndexRetryScheduled = false
+				local found = indexKnownGeneratorContainers()
+				if found == 0 and next(runtime.generators) == nil then
+					state.scanDirty = true
+				end
+			end)
 		end
 		end, debug.traceback)
 		state.scanInProgress = false
@@ -2624,8 +2701,22 @@ end
 remember(Workspace.DescendantAdded:Connect(function(object)
 	if not runtime.running then return end
 	if object:IsA("Model") or object:IsA("BasePart") then
-		if hasGeneratorSignal(object) or normalize(object.Name):find("generator", 1, true) then
-			addGeneratorCandidate(object)
+		local namedGeneratorAncestor = findAncestorModelWithName(object, "generator")
+		if hasGeneratorSignal(object)
+			or normalize(object.Name):find("generator", 1, true)
+			or namedGeneratorAncestor then
+			addGeneratorCandidate(namedGeneratorAncestor or object)
+			-- Attributes/tags often replicate one frame after the model. A
+			-- delayed bounded retry promotes that already-known ancestor without
+			-- scheduling a full Workspace scan for every BasePart.
+			if namedGeneratorAncestor then
+				task.delay(0.35, function()
+					if runtime.running and _G[KEY] == runtime
+						and namedGeneratorAncestor.Parent then
+						addGeneratorCandidate(namedGeneratorAncestor)
+					end
+				end)
+			end
 		end
 		addExitCandidate(object)
 		if object:IsA("Model") then addZombieCandidate(object) end
@@ -2845,6 +2936,10 @@ remember(RunService.Heartbeat:Connect(function()
 		updateNPCAuras()
 	end
 	local currentMap = Workspace:FindFirstChild("Map")
+	if now >= (state.nextKnownGeneratorProbeAt or -math.huge) then
+		state.nextKnownGeneratorProbeAt = now + CONFIG.knownGeneratorProbeInterval
+		indexKnownGeneratorContainers()
+	end
 	if state.scanDirty or currentMap ~= state.lastMap
 		or now - state.lastScan >= CONFIG.rescanInterval then
 		scanWorkspace()
@@ -2899,6 +2994,7 @@ _G.StopVDAssist = runtime.Stop
 _G.StopFixedVDAssist = runtime.Stop
 
 scanWorkspace()
+indexKnownGeneratorContainers()
 updatePlayerAuras()
 updateNPCAuras()
 local initialNow = os.clock()

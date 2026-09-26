@@ -40,9 +40,13 @@ local CONFIG = {
 	fogEnd = 100000,
 	boost = {
 		Enabled = true,
-		Brightness = 0.22,
+		-- The lobby profile already supplies the ambient lift. Keep only a very
+		-- small correction so the match is not washed out in bright areas.
+		Brightness = 0.03,
 		Contrast = 0.0,
 		Saturation = 0.0,
+		-- ColorShift_Top already carries the lobby warmth; do not stack another
+		-- yellow tint on the camera correction.
 		TintColor = Color3.fromRGB(255, 255, 255),
 	},
 }
@@ -172,6 +176,8 @@ end
 -- a dark map profile again after we start, so the values are reasserted while
 -- the match is active and restored from the first observed state on exit.
 local LOBBY_PROFILE = {
+	-- Values from the game's applyLobbyLighting function. The camera boost is
+	-- deliberately small so this keeps the lobby's warm balance without washout.
 	Brightness = 3,
 	ExposureCompensation = 0,
 	Ambient = Color3.fromRGB(0, 0, 0),
@@ -179,8 +185,12 @@ local LOBBY_PROFILE = {
 	ColorShift_Top = Color3.fromRGB(255, 192, 146),
 	ColorShift_Bottom = Color3.fromRGB(0, 0, 0),
 	ClockTime = 17,
+	-- Keep the exact lobby reflection balance. Zeroing these values makes
+	-- enclosed map areas visibly darker and is not what the game's lobby uses.
 	EnvironmentDiffuseScale = 0.222,
 	EnvironmentSpecularScale = 1,
+	GlobalShadows = false,
+	ShadowSoftness = 0,
 }
 
 local function suppressPostEffect(effect: Instance)

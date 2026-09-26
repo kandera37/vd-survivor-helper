@@ -514,6 +514,9 @@ local Config = {
 	veilWallAimHz = 12,
 	veilWallAimMinimumDistanceStrong = 8.0,
 	veilWallAimMinimumDistanceFallback = 18.0,
+	-- A head/root look vector is only a coarse fallback. At long range it is
+	-- not evidence of a fired projectile and must not seize movement authority.
+	veilWallAimFallbackMaximumDistance = 36.0,
 	veilWallAimMaximumDistance = 95.0,
 	-- Fresh Veil traces resolved damage while the root/head fallback was still at
 	-- dot=0.9709, and the old 0.30-second evidence gate left only 0.144 seconds to
@@ -522,7 +525,7 @@ local Config = {
 	veilWallAimStrongDot = 0.965,
 	veilWallAimFallbackDot = 0.970,
 	veilWallAimStrongSustain = 0.10,
-	veilWallAimFallbackSustain = 0.08,
+	veilWallAimFallbackSustain = 0.18,
 	veilWallAimFallbackMaximumSpeed = 5.0,
 	veilWallAimReleaseDot = 0.94,
 	veilWallAimReleaseGrace = 0.40,
@@ -939,7 +942,10 @@ local Config = {
 	unsafeTraversalWindowEscapeProbeDistance = 10.0,
 	unsafeTraversalWindowEscapeMinimumClearance = 3.0,
 	unsafeTraversalWindowEscapeMaximumTowardDot = 0.10,
-	unsafeTraversalWindowEscapeMinimumAwayDot = -0.05,
+	-- A veto escape must create real separation from the Killer.  The old
+	-- negative floor accepted a purely lateral route (awayDot=0.00 in
+	-- logs1.md), which sent the survivor across the same attack line.
+	unsafeTraversalWindowEscapeMinimumAwayDot = 0.25,
 	unsafeTraversalWindowEscapePlanRetryInterval = 0.06,
 	unsafeTraversalWindowEscapeMaximumPlanAttempts = 5,
 	lockedThreatVisualWarningEnabled = false,
@@ -5011,6 +5017,9 @@ local PredictivePlanner = {}
 -- client AnimationPlayed signal to HealthChanged. Runtime failures refine the
 -- value with a bounded moving average; an unobserved ID uses the family default.
 local PREDICTIVE_IMPACT_DELAY_BY_ID = {
+	-- In the fresh trace this exact Veil projectile reached HealthChanged about
+	-- 0.327s after the signal. Never inherit the synthetic wall-aim 1.20s horizon.
+	["86266790353635"] = 0.28,
 	-- Fresh Slasher traces: damage followed 110355... in 0.234 s; the supplied
 	-- v5.5.76 trace reached HealthChanged only 0.188 s after 139369.... Clamp that
 	-- second phase to the conservative minimum so the planner cannot certify travel
@@ -10359,6 +10368,17 @@ function ThreatController.MergeSignal(threat: any, id: string, metadata: any, tr
 		threat.kind = metadata.kind or threat.kind
 		threat.synthetic = false
 		threat.confirmedAimGuard = false
+		if id == "86266790353635" then
+			-- Exact projectile timing supersedes the synthetic wall-aim horizon.
+			-- Keeping rollingHorizonDelay=1.20 here made the planner certify a
+			-- forecast that no longer belonged to this animation.
+			threat.rollingHorizon = false
+			threat.rollingHorizonDelay = nil
+			threat.aimImpactDelay = nil
+			threat.motionHoldPadding = nil
+			threat.motionImpactAt = nil
+			threat.motionHoldUntil = t
+		end
 		if id == "86266790353635"
 			and State.root
 			and threat.killerRoot
@@ -11782,10 +11802,14 @@ function ThreatController.UpdateVeilAimGuard(): ()
 	local fallbackMotionAllowed = strongSource
 		or horizontal(killerRoot.AssemblyLinearVelocity).Magnitude
 			<= Config.veilWallAimFallbackMaximumSpeed
+	local fallbackDistanceAllowed = strongSource
+		or distance <= Config.veilWallAimFallbackMaximumDistance
 	local qualifiedSample = fallbackMotionAllowed
+		and fallbackDistanceAllowed
 		and distance >= minimumDistance
 		and sample.dot >= acquireDot
 	local nearAimSample = fallbackMotionAllowed
+		and fallbackDistanceAllowed
 		and distance >= minimumDistance
 		and sample.dot >= Config.veilWallAimReleaseDot
 	aimState.lastResolvedQualified = qualifiedSample
@@ -23579,9 +23603,19 @@ local function shouldVetoUnsafeTraversalSpace(): (boolean, any)
 		local originSideEscape = playerOnOriginSide
 			and killerOnOriginSide
 			and towardDot
-				<= Config.unsafeTraversalPalletOriginEscapeTowardDot
+			<= Config.unsafeTraversalPalletOriginEscapeTowardDot
 			and killerApproach
-				<= Config.unsafeTraversalPalletOriginEscapeMaximumApproach
+			<= Config.unsafeTraversalPalletOriginEscapeMaximumApproach
+		local retreatingKillerEscape = playerOnOriginSide
+			and killerOnOriginSide
+			and killerApproach <= -1.0
+			and relativeApproach <= 0.5
+		if retreatingKillerEscape then
+			-- The first logs1.md veto had killerApproach=-7.39 and
+			-- relativeApproach=-0.66: the Killer was moving away.  Facing alone
+			-- must not turn a safe native vault/drop edge into an open-field detour.
+			return false, traversalSample("pallet-origin-side-killer-retreating")
+		end
 		if originSideEscape then
 			-- This is the normal pallet-loop swap: both characters are on the origin
 			-- side, the survivor crosses away and the Killer is not advancing through
@@ -23593,10 +23627,13 @@ local function shouldVetoUnsafeTraversalSpace(): (boolean, any)
 			and palletKillerDistance
 				<= Config.unsafeTraversalPalletContestedDistance
 			and math.abs(palletKillerSide)
-				<= math.abs(palletPlayerSide)
-					+ Config.unsafeTraversalPalletContestedDepthSlack
+			<= math.abs(palletPlayerSide)
+				+ Config.unsafeTraversalPalletContestedDepthSlack
 			and (
-				facing >= Config.unsafeTraversalPalletContestedFacing
+				(
+					facing >= Config.unsafeTraversalPalletContestedFacing
+					and killerApproach >= Config.unsafeTraversalWindowThreatApproach
+				)
 				or relativeApproach
 					>= Config.unsafeTraversalPalletContestedRelativeApproach
 			)
@@ -24308,6 +24345,7 @@ local function runSelfTests(): ()
 	tests.veilWallAimGuard = Config.veilWallAimEnabled == true
 		and Config.veilWallAimStrongDot > Config.veilWallAimReleaseDot
 		and Config.veilWallAimFallbackDot >= Config.veilWallAimStrongDot
+		and Config.veilWallAimFallbackMaximumDistance <= 36.0
 		and Config.veilWallAimStrongSustain <= 0.35
 		and Config.veilWallAimFallbackSustain <= 0.30
 		and Config.veilWallAimEvidenceDecayRate < 1.0
@@ -24318,6 +24356,10 @@ local function runSelfTests(): ()
 		and Config.veilLongApproachGuardSustain >= 0.20
 		and predictiveFamilyProfile("VEIL_WALL_ARROW_AIM").lineAttack == true
 		and predictiveFamilyProfile("VEIL_WALL_ARROW_AIM").requireFullCertificate == true
+	tests.veilExactProjectileTimingFresh =
+		PREDICTIVE_IMPACT_DELAY_BY_ID["86266790353635"] ~= nil
+		and PREDICTIVE_IMPACT_DELAY_BY_ID["86266790353635"] <= 0.30
+		and IMPACT_TIMING_LEARNING_DISABLED_BY_ID["86266790353635"] == true
 	local veilMeleeProfile = predictiveFamilyProfile("VEIL_MELEE", "78935059863801")
 	tests.veilMeleeReachCalibrated = veilMeleeProfile.hitRadius >= 9.25
 		and veilMeleeProfile.killerSpeed >= 28.0
@@ -24524,6 +24566,7 @@ local function runSelfTests(): ()
 		and Config.unsafeTraversalPalletContestedDistance <= 10.0
 		and Config.unsafeTraversalPalletContestedDepthSlack <= 1.5
 		and Config.unsafeTraversalPalletContestedFacing >= 0.70
+		and Config.unsafeTraversalWindowEscapeMinimumAwayDot >= 0.20
 		and Config.unsafeTraversalWindowEtaEnabled == true
 		and Config.unsafeTraversalWindowPredictionDistance <= 18.0
 		and Config.unsafeTraversalWindowEmergencyDistance <= 8.0
